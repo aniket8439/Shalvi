@@ -1,6 +1,6 @@
 # 🤖 SHALVI — Personal AI Voice Assistant
 
-> *Inspired by Tony Stark's FRIDAY — built for Aniket.*
+> *Inspired by Someone very close.*
 
 ## Features
 - 🎙️ Voice input (browser mic / push-to-talk)
