@@ -62,31 +62,6 @@
         }
         .btn-clear:hover { border-color: var(--accent); color: var(--text); }
 
-        /* Wake word indicator */
-        .wake-controls { display: flex; align-items: center; gap: 10px; }
-        .wake-toggle {
-            background: var(--card); border: 1px solid var(--border);
-            color: var(--text-dim); padding: 8px 14px; border-radius: 8px;
-            cursor: pointer; font-size: 12px; transition: all 0.2s;
-            display: flex; align-items: center; gap: 6px;
-        }
-        .wake-toggle:hover { border-color: var(--accent); color: var(--text); }
-        .wake-toggle.active { border-color: #4ade80; color: #4ade80; }
-        .wake-toggle .dot {
-            width: 8px; height: 8px; border-radius: 50%;
-            background: var(--text-dim); transition: all 0.2s;
-        }
-        .wake-toggle.active .dot { background: #4ade80; box-shadow: 0 0 8px rgba(74,222,128,0.5); }
-        .wake-status {
-            font-size: 11px; color: var(--text-dim);
-            min-width: 100px; text-align: center;
-        }
-        .wake-status.heard { color: var(--accent); font-weight: 600; animation: wake-flash 0.5s ease; }
-        @keyframes wake-flash {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.4; }
-        }
-
         /* Chat Area */
         .chat-area {
             flex: 1;
@@ -221,13 +196,7 @@
                 <div class="status">Online — ready for you, Aniket</div>
             </div>
         </div>
-        <div class="wake-controls">
-            <div class="wake-status" id="wakeStatus"></div>
-            <button class="wake-toggle" id="wakeToggle" onclick="toggleWakeWord()" title="Wake word: say 'Shalvi'">
-                <span class="dot"></span> Wake Word
-            </button>
-            <button class="btn-clear" onclick="clearChat()">Clear Chat</button>
-        </div>
+        <button class="btn-clear" onclick="clearChat()">Clear Chat</button>
     </div>
 
     <div class="chat-area" id="chatArea">
@@ -266,270 +235,46 @@
         const typing = document.getElementById('typing');
         const welcome = document.getElementById('welcome');
         const micBtn = document.getElementById('micBtn');
-        const wakeToggle = document.getElementById('wakeToggle');
-        const wakeStatus = document.getElementById('wakeStatus');
         let isRecording = false;
+        let recognition = null;
         let currentAudio = null;
-        let isSending = false;
 
-        // ─── Wake Word Detection ───────────────────────────────
-        let wakeWordActive = false;
-        let wakeRecognition = null;
-        let commandRecognition = null;
-
-        const WAKE_PHRASES = ['shalvi', 'shelby', 'shelvie', 'chalvi', 'sharvi', 'shaalvi', 'salvi', 'shelvi', 'shulvi', 'shall we', 'shall v', 'shal vi', 'shal we', 'shilvi', 'shilpi', 'shulbi', 'shelbi'];
-
-        function detectWakeWord(transcript) {
-            const text = transcript.toLowerCase().trim();
-            // Log what Chrome hears so we can debug
-            console.log('[SHALVI WAKE] heard:', text);
-            for (const w of WAKE_PHRASES) {
-                const idx = text.indexOf(w);
-                if (idx !== -1) {
-                    const command = text.slice(idx + w.length).trim();
-                    return { detected: true, command };
-                }
-            }
-            return { detected: false, command: '' };
-        }
-
-        function createRecognition() {
+        // Speech recognition setup
+        if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
             const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-            if (!SR) return null;
-            return new SR();
-        }
+            recognition = new SR();
+            recognition.continuous = false;
+            recognition.interimResults = false;
+            recognition.lang = 'en-US';
 
-        // Background listener — always on, listening for wake word
-        function setupWakeListener() {
-            wakeRecognition = createRecognition();
-            if (!wakeRecognition) return;
-
-            wakeRecognition.continuous = true;
-            wakeRecognition.interimResults = true;
-            wakeRecognition.lang = 'en-IN';
-
-            let wakeDebounce = null;
-            let alreadyTriggered = false;
-
-            wakeRecognition.onresult = (e) => {
-                if (alreadyTriggered) return;
-                
-                // Check ALL results, not just from resultIndex
-                for (let i = 0; i < e.results.length; i++) {
-                    const transcript = e.results[i][0].transcript;
-                    const { detected, command } = detectWakeWord(transcript);
-                    
-                    if (detected) {
-                        if (e.results[i].isFinal) {
-                            if (wakeDebounce) clearTimeout(wakeDebounce);
-                            alreadyTriggered = true;
-                            onWakeWordDetected(command);
-                            return;
-                        } else {
-                            wakeStatus.textContent = '🎯 Heard you...';
-                            wakeStatus.className = 'wake-status heard';
-                            if (wakeDebounce) clearTimeout(wakeDebounce);
-                            wakeDebounce = setTimeout(() => {
-                                alreadyTriggered = true;
-                                onWakeWordDetected(command);
-                            }, 600);
-                        }
-                    }
-                }
-            };
-
-            wakeRecognition.onend = () => {
-                // Auto-restart if wake word mode is still active
-                if (wakeWordActive && !isRecording) {
-                    setTimeout(() => {
-                        try { wakeRecognition.start(); } catch(e) {}
-                    }, 300);
-                }
-            };
-
-            wakeRecognition.onerror = (e) => {
-                if (e.error === 'not-allowed') {
-                    wakeWordActive = false;
-                    wakeToggle.classList.remove('active');
-                    wakeStatus.textContent = 'Mic denied';
-                    return;
-                }
-                // Auto-restart on other errors
-                if (wakeWordActive) {
-                    setTimeout(() => {
-                        try { wakeRecognition.start(); } catch(e) {}
-                    }, 1000);
-                }
-            };
-        }
-
-        function onWakeWordDetected(immediateCommand) {
-            // Stop wake listener
-            try { wakeRecognition.stop(); } catch(e) {}
-
-            // Play a subtle activation sound via oscillator
-            playActivationBeep();
-
-            wakeStatus.textContent = '🟢 Listening...';
-            wakeStatus.className = 'wake-status heard';
-
-            if (immediateCommand && immediateCommand.length > 2) {
-                // Wake word + command in one sentence: "Hey Shalvi what's the weather"
-                msgInput.value = immediateCommand;
+            recognition.onresult = (e) => {
+                const text = e.results[0][0].transcript;
+                msgInput.value = text;
                 sendMessage();
-                // Restart wake listener after response
-                setTimeout(() => restartWakeListener(), 1000);
-            } else {
-                // Just wake word — start command capture
-                startCommandCapture();
-            }
-        }
-
-        function startCommandCapture() {
-            commandRecognition = createRecognition();
-            if (!commandRecognition) return;
-
-            commandRecognition.continuous = true;
-            commandRecognition.interimResults = true;
-            commandRecognition.lang = 'en-US';
-
-            isRecording = true;
-            micBtn.classList.add('recording');
-
-            let finalTranscript = '';
-            let silenceTimer = null;
-            let lastSpeechTime = Date.now();
-            const SILENCE_TIMEOUT = 2500; // 2.5s silence = done speaking
-
-            function resetSilenceTimer() {
-                lastSpeechTime = Date.now();
-                if (silenceTimer) clearTimeout(silenceTimer);
-                silenceTimer = setTimeout(() => {
-                    // User has been silent — they're done
-                    try { commandRecognition.stop(); } catch(e) {}
-                }, SILENCE_TIMEOUT);
-            }
-
-            // Start the initial silence timer (if user says nothing for 5s after wake)
-            let initialTimer = setTimeout(() => {
-                if (!finalTranscript && !msgInput.value.trim()) {
-                    try { commandRecognition.stop(); } catch(e) {}
-                }
-            }, 5000);
-
-            commandRecognition.onresult = (e) => {
-                clearTimeout(initialTimer);
-                let interim = '';
-                finalTranscript = '';
-                for (let i = 0; i < e.results.length; i++) {
-                    if (e.results[i].isFinal) {
-                        finalTranscript += e.results[i][0].transcript;
-                    } else {
-                        interim += e.results[i][0].transcript;
-                    }
-                }
-                msgInput.value = finalTranscript + interim;
-                wakeStatus.textContent = '🟢 Listening...';
-
-                // Reset silence timer on every new speech
-                resetSilenceTimer();
             };
-
-            commandRecognition.onspeechend = () => {
-                // Browser detected speech ended — give a short grace period
-                if (silenceTimer) clearTimeout(silenceTimer);
-                silenceTimer = setTimeout(() => {
-                    try { commandRecognition.stop(); } catch(e) {}
-                }, 1500);
-            };
-
-            commandRecognition.onend = () => {
-                if (silenceTimer) clearTimeout(silenceTimer);
-                clearTimeout(initialTimer);
+            recognition.onend = () => {
                 isRecording = false;
                 micBtn.classList.remove('recording');
-                const text = msgInput.value.trim();
-                if (text) {
-                    sendMessage();
-                }
-                setTimeout(() => restartWakeListener(), 500);
             };
-
-            commandRecognition.onerror = () => {
-                if (silenceTimer) clearTimeout(silenceTimer);
-                clearTimeout(initialTimer);
+            recognition.onerror = () => {
                 isRecording = false;
                 micBtn.classList.remove('recording');
-                setTimeout(() => restartWakeListener(), 500);
             };
-
-            commandRecognition.start();
         }
 
-        function restartWakeListener() {
-            if (!wakeWordActive) return;
-            wakeStatus.textContent = 'Listening for "Shalvi"';
-            wakeStatus.className = 'wake-status';
-            // Re-create the wake listener to reset state
-            setupWakeListener();
-            try { wakeRecognition.start(); } catch(e) {}
-        }
-
-        function toggleWakeWord() {
-            if (!createRecognition()) {
-                alert('Speech recognition not supported. Use Chrome.');
-                return;
-            }
-
-            wakeWordActive = !wakeWordActive;
-
-            if (wakeWordActive) {
-                if (!wakeRecognition) setupWakeListener();
-                wakeToggle.classList.add('active');
-                wakeStatus.textContent = 'Listening for "Shalvi"';
-                try { wakeRecognition.start(); } catch(e) {}
-            } else {
-                wakeToggle.classList.remove('active');
-                wakeStatus.textContent = '';
-                try { wakeRecognition.stop(); } catch(e) {}
-            }
-        }
-
-        function playActivationBeep() {
-            try {
-                const ctx = new (window.AudioContext || window.webkitAudioContext)();
-                const osc = ctx.createOscillator();
-                const gain = ctx.createGain();
-                osc.connect(gain);
-                gain.connect(ctx.destination);
-                osc.frequency.setValueAtTime(880, ctx.currentTime);
-                osc.frequency.setValueAtTime(1320, ctx.currentTime + 0.08);
-                gain.gain.setValueAtTime(0.15, ctx.currentTime);
-                gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.2);
-                osc.start(ctx.currentTime);
-                osc.stop(ctx.currentTime + 0.2);
-            } catch(e) {}
-        }
-
-        // ─── Manual Mic (Push-to-talk) ─────────────────────────
         function toggleMic() {
-            const sr = createRecognition();
-            if (!sr) { alert('Speech recognition not supported. Use Chrome.'); return; }
-
+            if (!recognition) { alert('Speech recognition not supported in this browser. Use Chrome.'); return; }
             if (isRecording) {
-                if (commandRecognition) commandRecognition.stop();
-                return;
+                recognition.stop();
+            } else {
+                // Stop any playing audio
+                if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+                recognition.start();
+                isRecording = true;
+                micBtn.classList.add('recording');
             }
-
-            // Pause wake listener while manually recording
-            if (wakeWordActive) {
-                try { wakeRecognition.stop(); } catch(e) {}
-            }
-            if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-            startCommandCapture();
         }
 
-        // ─── Chat Functions ────────────────────────────────────
         function addMessage(text, role) {
             if (welcome) welcome.style.display = 'none';
             const div = document.createElement('div');
@@ -552,8 +297,7 @@
 
         async function sendMessage() {
             const text = msgInput.value.trim();
-            if (!text || isSending) return;
-            isSending = true;
+            if (!text) return;
             msgInput.value = '';
             addMessage(text, 'user');
 
@@ -571,31 +315,23 @@
                 typing.classList.remove('show');
                 addMessage(data.reply, 'ai');
 
-                // Play audio — pause wake listener while Shalvi speaks
+                // Play audio
                 if (data.has_audio && data.audio_url) {
                     if (currentAudio) { currentAudio.pause(); }
-                    if (wakeWordActive) { try { wakeRecognition.stop(); } catch(e) {} }
                     currentAudio = new Audio(data.audio_url);
-                    currentAudio.onended = () => { restartWakeListener(); };
-                    currentAudio.play().catch(() => { restartWakeListener(); });
+                    currentAudio.play().catch(() => {});
                 }
             } catch (err) {
                 typing.classList.remove('show');
                 addMessage("Sorry Aniket, I'm not well can you please check my health.", 'ai');
             }
-            isSending = false;
-        }
-
-        async function clearChat() {
-            chatArea.innerHTML = '';
-            if (welcome) { chatArea.appendChild(welcome); welcome.style.display = 'flex'; }
-            await fetch('/api/clear', { method: 'POST' });
         }
 
         msgInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
         });
 
+        // Focus input on load
         msgInput.focus();
     </script>
 </body>
