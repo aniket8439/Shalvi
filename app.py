@@ -1,8 +1,3 @@
-"""
-SHALVI — Flask Application
-Web server with REST API and real-time chat UI.
-"""
-
 import os
 from flask import Flask, request, jsonify, send_file, render_template
 from flask_cors import CORS
