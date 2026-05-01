@@ -62,6 +62,31 @@
         }
         .btn-clear:hover { border-color: var(--accent); color: var(--text); }
 
+        /* Wake word indicator */
+        .wake-controls { display: flex; align-items: center; gap: 10px; }
+        .wake-toggle {
+            background: var(--card); border: 1px solid var(--border);
+            color: var(--text-dim); padding: 8px 14px; border-radius: 8px;
+            cursor: pointer; font-size: 12px; transition: all 0.2s;
+            display: flex; align-items: center; gap: 6px;
+        }
+        .wake-toggle:hover { border-color: var(--accent); color: var(--text); }
+        .wake-toggle.active { border-color: #4ade80; color: #4ade80; }
+        .wake-toggle .dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: var(--text-dim); transition: all 0.2s;
+        }
+        .wake-toggle.active .dot { background: #4ade80; box-shadow: 0 0 8px rgba(74,222,128,0.5); }
+        .wake-status {
+            font-size: 11px; color: var(--text-dim);
+            min-width: 100px; text-align: center;
+        }
+        .wake-status.heard { color: var(--accent); font-weight: 600; animation: wake-flash 0.5s ease; }
+        @keyframes wake-flash {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
         /* Chat Area */
         .chat-area {
             flex: 1;
@@ -196,14 +221,20 @@
                 <div class="status">Online — ready for you, Aniket</div>
             </div>
         </div>
-        <button class="btn-clear" onclick="clearChat()">Clear Chat</button>
+        <div class="wake-controls">
+            <div class="wake-status" id="wakeStatus"></div>
+            <button class="wake-toggle" id="wakeToggle" onclick="toggleWakeWord()" title="Wake word: say 'Shalvi'">
+                <span class="dot"></span> Wake Word
+            </button>
+            <button class="btn-clear" onclick="clearChat()">Clear Chat</button>
+        </div>
     </div>
 
     <div class="chat-area" id="chatArea">
         <div class="welcome" id="welcome">
             <div class="logo" style="width:64px;height:64px;font-size:24px;">S</div>
             <h2>Hey Aniket 👋</h2>
-            <p>I'm Shalvi, your personal assistant. Talk to me or type below.</p>
+            <p>I'm Shalvi, your personalised friend's replica. Talk to me or type below.</p>
         </div>
     </div>
 
@@ -235,46 +266,354 @@
         const typing = document.getElementById('typing');
         const welcome = document.getElementById('welcome');
         const micBtn = document.getElementById('micBtn');
+        const wakeToggle = document.getElementById('wakeToggle');
+        const wakeStatus = document.getElementById('wakeStatus');
         let isRecording = false;
-        let recognition = null;
         let currentAudio = null;
+        let isSending = false;
 
-        // Speech recognition setup
-        if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-            const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-            recognition = new SR();
-            recognition.continuous = false;
-            recognition.interimResults = false;
-            recognition.lang = 'en-US';
+        // ─── Deepgram STT Engine ───────────────────────────────
+        let deepgramKey = null;
+        let mediaRecorder = null;
+        let dgSocket = null;
+        let micStream = null;
 
-            recognition.onresult = (e) => {
-                const text = e.results[0][0].transcript;
-                msgInput.value = text;
-                sendMessage();
+        // Wake word state
+        let wakeWordActive = false;
+        let wakeTriggered = false;
+        let dgMode = 'idle'; // 'idle' | 'wake' | 'command' | 'session'
+        let inSession = false; // true = conversation active, no need to say wake word
+        let sessionSilenceTimer = null;
+        const SESSION_TIMEOUT = 30000; // 30s silence → back to wake mode
+
+        const WAKE_PHRASES = ['shalvi', 'shelby', 'shelvie', 'chalvi', 'sharvi', 'salvi', 'shelvi', 'charlie', 'talvi', 'shulvi', 'sylvie', 'selvie', 'chalbi', 'shalbi', 'shilvi', 'shilpi', 'salbi', 'shelbi', 'shall we', 'shall v', 'chelvie', 'thalvi', 'jhalvi', 'zalvi'];
+
+        // Levenshtein for fuzzy matching
+        function levenshtein(a, b) {
+            const m = a.length, n = b.length;
+            const dp = Array(m + 1).fill(0).map(() => Array(n + 1).fill(0));
+            for (let i = 0; i <= m; i++) dp[i][0] = i;
+            for (let j = 0; j <= n; j++) dp[0][j] = j;
+            for (let i = 1; i <= m; i++)
+                for (let j = 1; j <= n; j++)
+                    dp[i][j] = a[i-1] === b[j-1] ? dp[i-1][j-1] : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
+            return dp[m][n];
+        }
+
+        function detectWakeWord(transcript) {
+            const text = transcript.toLowerCase().trim();
+            for (const w of WAKE_PHRASES) {
+                const idx = text.indexOf(w);
+                if (idx !== -1) {
+                    return { detected: true, command: text.slice(idx + w.length).trim() };
+                }
+            }
+            // Fuzzy match
+            for (const word of text.split(/\s+/)) {
+                if (word.length > 3) {
+                    for (const phrase of WAKE_PHRASES) {
+                        const sim = 1 - (levenshtein(word, phrase) / Math.max(word.length, phrase.length));
+                        if (sim > 0.55) {
+                            console.log(`[WAKE] fuzzy: "${word}" ≈ "${phrase}" (${(sim*100).toFixed(0)}%)`);
+                            const idx = text.indexOf(word);
+                            return { detected: true, command: text.slice(idx + word.length).trim() };
+                        }
+                    }
+                }
+            }
+            return { detected: false, command: '' };
+        }
+
+        async function getDeepgramKey() {
+            if (deepgramKey) return deepgramKey;
+            const res = await fetch('/api/deepgram-key');
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+            deepgramKey = data.key;
+            return deepgramKey;
+        }
+
+        async function getMicStream() {
+            if (micStream) return micStream;
+            micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            return micStream;
+        }
+
+        function startDeepgramStream(mode) {
+            // mode: 'wake' or 'command'
+            dgMode = mode;
+            console.log(`[DG] Starting stream in ${mode} mode`);
+
+            const key = deepgramKey;
+            const url = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
+                model: 'nova-2',
+                language: 'en-IN',
+                smart_format: 'true',
+                interim_results: 'true',
+                utterance_end_ms: '1500',
+                vad_events: 'true',
+                endpointing: mode === 'command' ? '2500' : '300',
+            }).toString();
+
+            dgSocket = new WebSocket(url, ['token', key]);
+
+            let commandText = '';
+            let commandSilenceTimer = null;
+            let wakeDebounce = null;
+
+            dgSocket.onopen = () => {
+                console.log(`[DG] WebSocket open (${mode})`);
+                if (mode === 'wake') {
+                    wakeStatus.textContent = '🎤 Listening for "Shalvi"';
+                    wakeTriggered = false;
+                }
+
+                // Start sending audio
+                mediaRecorder = new MediaRecorder(micStream, { mimeType: 'audio/webm' });
+                mediaRecorder.ondataavailable = (e) => {
+                    if (dgSocket && dgSocket.readyState === WebSocket.OPEN && e.data.size > 0) {
+                        dgSocket.send(e.data);
+                    }
+                };
+                mediaRecorder.start(250); // send chunks every 250ms
             };
-            recognition.onend = () => {
-                isRecording = false;
-                micBtn.classList.remove('recording');
+
+            dgSocket.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+
+                if (msg.type === 'Results') {
+                    const transcript = msg.channel?.alternatives?.[0]?.transcript || '';
+                    const isFinal = msg.is_final;
+
+                    if (!transcript) return;
+
+                    console.log(`[DG ${mode}] ${isFinal ? 'FINAL' : 'interim'}: "${transcript}"`);
+
+                    if (mode === 'wake') {
+                        // Show what we hear
+                        wakeStatus.textContent = '👂 "' + transcript.substring(0, 30) + '"';
+
+                        const { detected, command } = detectWakeWord(transcript);
+                        if (detected && !wakeTriggered) {
+                            if (isFinal) {
+                                if (wakeDebounce) clearTimeout(wakeDebounce);
+                                wakeTriggered = true;
+                                onWakeWordDetected(command);
+                            } else {
+                                wakeStatus.textContent = '🎯 Heard "Shalvi"!';
+                                wakeStatus.className = 'wake-status heard';
+                                if (wakeDebounce) clearTimeout(wakeDebounce);
+                                const cmd = command;
+                                wakeDebounce = setTimeout(() => {
+                                    if (!wakeTriggered) {
+                                        wakeTriggered = true;
+                                        onWakeWordDetected(cmd);
+                                    }
+                                }, 500);
+                            }
+                        }
+                    } else if (mode === 'command') {
+                        if (isFinal) {
+                            commandText += (commandText ? ' ' : '') + transcript;
+                            msgInput.value = commandText;
+                        } else {
+                            msgInput.value = commandText + (commandText ? ' ' : '') + transcript;
+                        }
+                        wakeStatus.textContent = '🟢 Listening...';
+
+                        // Reset silence timer
+                        if (commandSilenceTimer) clearTimeout(commandSilenceTimer);
+                        commandSilenceTimer = setTimeout(() => {
+                            finishCommandCapture(commandText || msgInput.value.trim());
+                        }, 2500);
+                    }
+                }
+
+                // Utterance end = user stopped talking
+                if (msg.type === 'UtteranceEnd' && mode === 'command') {
+                    const text = commandText || msgInput.value.trim();
+                    if (text) {
+                        if (commandSilenceTimer) clearTimeout(commandSilenceTimer);
+                        finishCommandCapture(text);
+                    }
+                }
             };
-            recognition.onerror = () => {
-                isRecording = false;
-                micBtn.classList.remove('recording');
+
+            dgSocket.onerror = (e) => {
+                console.log('[DG] WebSocket error:', e);
+                wakeStatus.textContent = '❌ Connection error';
+            };
+
+            dgSocket.onclose = () => {
+                console.log(`[DG] WebSocket closed (${mode})`);
+                if (mode === 'wake' && wakeWordActive && !wakeTriggered) {
+                    // Auto-reconnect for wake mode
+                    setTimeout(() => {
+                        if (wakeWordActive && !wakeTriggered) {
+                            console.log('[DG] Reconnecting wake listener...');
+                            startDeepgramStream('wake');
+                        }
+                    }, 500);
+                }
             };
         }
 
-        function toggleMic() {
-            if (!recognition) { alert('Speech recognition not supported in this browser. Use Chrome.'); return; }
-            if (isRecording) {
-                recognition.stop();
+        function stopDeepgramStream() {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                try { mediaRecorder.stop(); } catch(e) {}
+            }
+            if (dgSocket && dgSocket.readyState === WebSocket.OPEN) {
+                // Send close message to Deepgram
+                dgSocket.send(JSON.stringify({ type: 'CloseStream' }));
+                dgSocket.close();
+            }
+            dgSocket = null;
+            mediaRecorder = null;
+        }
+
+        function onWakeWordDetected(immediateCommand) {
+            console.log('[WAKE] Detected! Command:', immediateCommand);
+            stopDeepgramStream();
+            playActivationBeep();
+            enterSession();
+
+            wakeStatus.textContent = '🟢 Listening...';
+            wakeStatus.className = 'wake-status heard';
+
+            if (immediateCommand && immediateCommand.length > 2) {
+                msgInput.value = immediateCommand;
+                sendMessage();
             } else {
-                // Stop any playing audio
-                if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-                recognition.start();
-                isRecording = true;
-                micBtn.classList.add('recording');
+                // Start command capture
+                startSessionListening();
             }
         }
 
+        function enterSession() {
+            inSession = true;
+            resetSessionTimeout();
+            console.log('[SESSION] Conversation session started');
+        }
+
+        function resetSessionTimeout() {
+            if (sessionSilenceTimer) clearTimeout(sessionSilenceTimer);
+            sessionSilenceTimer = setTimeout(() => {
+                console.log('[SESSION] 30s silence — ending session');
+                endSession();
+            }, SESSION_TIMEOUT);
+        }
+
+        function endSession() {
+            inSession = false;
+            if (sessionSilenceTimer) clearTimeout(sessionSilenceTimer);
+            sessionSilenceTimer = null;
+            stopDeepgramStream();
+            isRecording = false;
+            micBtn.classList.remove('recording');
+            console.log('[SESSION] Ended, back to wake word mode');
+            restartWakeListener();
+        }
+
+        function startSessionListening() {
+            // Listen for next command in conversation (no wake word needed)
+            isRecording = true;
+            micBtn.classList.add('recording');
+            wakeStatus.textContent = '🟢 Listening...';
+            startDeepgramStream('command');
+        }
+
+        function finishCommandCapture(text) {
+            console.log('[CMD] Finishing with:', text);
+            stopDeepgramStream();
+            isRecording = false;
+            micBtn.classList.remove('recording');
+            if (text) {
+                msgInput.value = text;
+                sendMessage();
+            } else if (inSession) {
+                // No speech but still in session — keep listening
+                resetSessionTimeout();
+                startSessionListening();
+            } else {
+                restartWakeListener();
+            }
+        }
+
+        function restartWakeListener() {
+            if (!wakeWordActive) return;
+            if (inSession) {
+                // Still in session — go back to listening, not wake mode
+                wakeStatus.textContent = '🟢 Listening...';
+                wakeStatus.className = 'wake-status heard';
+                startSessionListening();
+                return;
+            }
+            wakeStatus.textContent = 'Listening for "Shalvi"';
+            wakeStatus.className = 'wake-status';
+            wakeTriggered = false;
+            startDeepgramStream('wake');
+        }
+
+        async function toggleWakeWord() {
+            wakeWordActive = !wakeWordActive;
+
+            if (wakeWordActive) {
+                try {
+                    wakeStatus.textContent = '⏳ Connecting...';
+                    await getDeepgramKey();
+                    await getMicStream();
+                    wakeToggle.classList.add('active');
+                    startDeepgramStream('wake');
+                } catch(e) {
+                    wakeWordActive = false;
+                    wakeStatus.textContent = '❌ ' + e.message;
+                    console.error('[WAKE] Setup failed:', e);
+                }
+            } else {
+                wakeToggle.classList.remove('active');
+                wakeStatus.textContent = '';
+                stopDeepgramStream();
+            }
+        }
+
+        function playActivationBeep() {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.frequency.setValueAtTime(880, ctx.currentTime);
+                osc.frequency.setValueAtTime(1320, ctx.currentTime + 0.08);
+                gain.gain.setValueAtTime(0.15, ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.2);
+                osc.start(ctx.currentTime);
+                osc.stop(ctx.currentTime + 0.2);
+            } catch(e) {}
+        }
+
+        // ─── Manual Mic (Push-to-talk) ─────────────────────────
+        async function toggleMic() {
+            if (isRecording) {
+                finishCommandCapture(msgInput.value.trim());
+                return;
+            }
+
+            try {
+                await getDeepgramKey();
+                await getMicStream();
+                // Pause wake listener
+                if (wakeWordActive) stopDeepgramStream();
+                if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+                isRecording = true;
+                micBtn.classList.add('recording');
+                startDeepgramStream('command');
+            } catch(e) {
+                alert('Mic error: ' + e.message);
+            }
+        }
+
+        // ─── Chat Functions ────────────────────────────────────
         function addMessage(text, role) {
             if (welcome) welcome.style.display = 'none';
             const div = document.createElement('div');
@@ -297,7 +636,8 @@
 
         async function sendMessage() {
             const text = msgInput.value.trim();
-            if (!text) return;
+            if (!text || isSending) return;
+            isSending = true;
             msgInput.value = '';
             addMessage(text, 'user');
 
@@ -315,23 +655,51 @@
                 typing.classList.remove('show');
                 addMessage(data.reply, 'ai');
 
-                // Play audio
                 if (data.has_audio && data.audio_url) {
                     if (currentAudio) { currentAudio.pause(); }
+                    // Pause listening while Shalvi speaks
+                    stopDeepgramStream();
+                    isRecording = false;
+                    micBtn.classList.remove('recording');
                     currentAudio = new Audio(data.audio_url);
-                    currentAudio.play().catch(() => {});
+                    currentAudio.onended = () => {
+                        if (inSession) {
+                            resetSessionTimeout();
+                            startSessionListening();
+                        } else {
+                            restartWakeListener();
+                        }
+                    };
+                    currentAudio.play().catch(() => {
+                        if (inSession) {
+                            resetSessionTimeout();
+                            startSessionListening();
+                        } else {
+                            restartWakeListener();
+                        }
+                    });
+                } else if (inSession) {
+                    // No audio, but still in session — resume listening
+                    resetSessionTimeout();
+                    startSessionListening();
                 }
             } catch (err) {
                 typing.classList.remove('show');
                 addMessage("Sorry Aniket, I'm not well can you please check my health.", 'ai');
             }
+            isSending = false;
+        }
+
+        async function clearChat() {
+            chatArea.innerHTML = '';
+            if (welcome) { chatArea.appendChild(welcome); welcome.style.display = 'flex'; }
+            await fetch('/api/clear', { method: 'POST' });
         }
 
         msgInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
         });
 
-        // Focus input on load
         msgInput.focus();
     </script>
 </body>
