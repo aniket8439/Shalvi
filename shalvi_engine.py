@@ -4,6 +4,7 @@ Core engine: personality, memory, and LLM integration.
 
 import os
 import json
+import re
 import asyncio
 import tempfile
 import edge_tts
@@ -36,7 +37,8 @@ Rules:
 class ShalviEngine:
     def __init__(self):
         self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        self.voice = os.getenv("SHALVI_VOICE", "en-US-AriaNeural")
+        self.voice_en = os.getenv("SHALVI_VOICE", "en-IN-NeerjaNeural")
+        self.voice_hi = os.getenv("SHALVI_VOICE_HI", "hi-IN-SwaraNeural")
         self.conversation_history = []
         self.max_history = 20  # Keep last 20 exchanges for context
 
@@ -67,19 +69,28 @@ class ShalviEngine:
         self.conversation_history.append({"role": "assistant", "content": reply})
         return reply
 
-    async def text_to_speech(self, text: str) -> str:
-        """Convert text to speech using Edge TTS (free). Returns path to audio file."""
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir=tempfile.gettempdir())
-        tmp.close()
-        communicate = edge_tts.Communicate(text, self.voice, rate="+5%", pitch="+0Hz")
-        await communicate.save(tmp.name)
-        return tmp.name
+    def _detect_language(self, text: str) -> str:
+        """Detect if text is primarily Hindi or English."""
+        devanagari = len(re.findall(r'[\u0900-\u097F]', text))
+        total = len(re.findall(r'\S', text))
+        if total > 0 and devanagari / total > 0.3:
+            return "hi"
+        return "en"
 
     def tts_sync(self, text: str) -> str:
-        """Synchronous wrapper for TTS."""
+        """Convert text to speech using Edge TTS. Auto-detects Hindi/English."""
+        lang = self._detect_language(text)
+        voice = self.voice_hi if lang == "hi" else self.voice_en
+
+        async def _tts():
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir=tempfile.gettempdir())
+            tmp.close()
+            communicate = edge_tts.Communicate(text, voice, rate="+5%", pitch="+0Hz")
+            await communicate.save(tmp.name)
+            return tmp.name
         loop = asyncio.new_event_loop()
         try:
-            return loop.run_until_complete(self.text_to_speech(text))
+            return loop.run_until_complete(_tts())
         finally:
             loop.close()
 
